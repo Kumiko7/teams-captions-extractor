@@ -7,4 +7,4 @@ Pulls automated captions from Teams and displays them in a local webpage, allowi
 4. Logs will be automatically saved in a /logs folder.
 5. Edit config.py for keywords to highlight (created from config.example.py on first run).
 
-Live captions must be turned on in the Teams meeting. The web page is only reachable from this computer.
+Live captions must be turned on in the Teams meeting.
