@@ -5,18 +5,29 @@ import os
 import datetime
 import ctypes
 import atexit  # Imported to handle termination saving
+import shutil
+import sys
 import uiautomation as auto
 from flask import Flask, render_template_string, request
 from flask_socketio import SocketIO
 
+# Don't crash on emoji in status messages when the console uses a non-UTF-8 code page (e.g. cp932)
+sys.stdout.reconfigure(errors="replace")
+sys.stderr.reconfigure(errors="replace")
+
 # ==========================================
 # CONFIGURATION
 # ==========================================
-KEYWORDS = ["edwin", "エドウィン", "えどうぃん"]
-PORT = 5000
-LOG_FOLDER = "logs"
-SEARCH_DEPTH = 60 
-LOG_INTERVAL_SECONDS = 10  # Write to file every 10 seconds
+# Personal settings live in config.py (gitignored). It is created from config.example.py on first run.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if not os.path.exists(os.path.join(SCRIPT_DIR, "config.py")):
+    shutil.copy(os.path.join(SCRIPT_DIR, "config.example.py"), os.path.join(SCRIPT_DIR, "config.py"))
+    print("Created config.py from config.example.py - edit it to set your keywords.")
+sys.path.insert(0, SCRIPT_DIR)
+from config import KEYWORDS, PORT, LOG_FOLDER, LOG_INTERVAL_SECONDS
+
+SEARCH_DEPTH = 60
+LOG_FOLDER = os.path.join(SCRIPT_DIR, LOG_FOLDER)  # Relative to the script, not the current directory
 
 # ==========================================
 # SYSTEM HELPERS
@@ -43,14 +54,15 @@ current_time_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 log_filename = f"transcript_{current_time_str}.txt"
 log_filepath = os.path.join(LOG_FOLDER, log_filename)
 transcript_memory = {}
+log_lock = threading.Lock()
 
 def update_log_file():
     """Writes the current transcript memory to disk."""
     try:
-        with open(log_filepath, "w", encoding="utf-8") as f:
+        with log_lock, open(log_filepath, "w", encoding="utf-8") as f:
             f.write(f"Meeting Transcript - Started {current_time_str}\n")
             f.write("==================================================\n\n")
-            for uid, data in transcript_memory.items():
+            for uid, data in list(transcript_memory.items()):
                 f.write(f"[{data.get('time')}] {data.get('speaker')}: {data.get('text')}\n")
         # print(f"💾 Log saved to {log_filename}") # Optional debug
     except Exception as e:
@@ -59,19 +71,28 @@ def update_log_file():
 # Register the save function to run when script is terminated
 atexit.register(update_log_file)
 
+# atexit does not run when the console window is closed with the X button,
+# so also save on console close / logoff / shutdown events.
+@ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+def console_ctrl_handler(event):
+    update_log_file()
+    return False  # Let Windows continue closing the process
+ctypes.windll.kernel32.SetConsoleCtrlHandler(console_ctrl_handler, True)
+
 # ==========================================
 # FLASK & SOCKET SETUP (FIXED)
 # ==========================================
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+# Only the local web page may connect, not other websites open in the browser
+socketio = SocketIO(app, cors_allowed_origins=[f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"], async_mode='threading')
 
 @socketio.on('connect')
 def handle_connect():
     print(f"✅ Web Client Connected! (SID: {request.sid})")
-    for uid, data in transcript_memory.items():
+    for uid, data in list(transcript_memory.items()):
         socketio.emit('caption_update', {'id': uid, 'text': data['text'], 'speaker': data['speaker']}, to=request.sid)
 
-HTML_TEMPLATE = """
+HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -97,13 +118,22 @@ HTML_TEMPLATE = """
         const status = document.getElementById('status');
         const keywords = {{ keywords | tojson }};
 
+        function escapeHtml(s) {
+            return s.replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+        }
+
+        function escapeRegex(s) {
+            return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        }
+
+        const keywordRegex = keywords.length
+            ? new RegExp(`(${keywords.map(k => escapeRegex(escapeHtml(k))).join('|')})`, 'gi')
+            : null;
+
+        // Escape the caption first so names/text from Teams can't inject HTML, then highlight keywords
         function processText(text) {
-            let processed = text;
-            keywords.forEach(word => {
-                const regex = new RegExp(`(${word})`, 'gi');
-                processed = processed.replace(regex, '<span class="highlight">$1</span>');
-            });
-            return processed;
+            const escaped = escapeHtml(text);
+            return keywordRegex ? escaped.replace(keywordRegex, '<span class="highlight">$1</span>') : escaped;
         }
 
         socket.on('connect', () => {
@@ -123,7 +153,7 @@ HTML_TEMPLATE = """
                 div = document.createElement('div');
                 div.id = 'msg-' + data.id;
                 div.className = 'caption-line';
-                div.innerHTML = `<div class="speaker">${data.speaker || ''}</div><div class="text"></div>`;
+                div.innerHTML = `<div class="speaker"></div><div class="text"></div>`;
                 container.appendChild(div);
             }
             const textEl = div.querySelector('.text');
@@ -178,6 +208,7 @@ def capture_loop():
     
     # Timing variable for log throttling
     last_save_time = time.time()
+    has_unsaved_updates = False
     
     with auto.UIAutomationInitializerInThread(debug=False):
         while True:
@@ -220,7 +251,6 @@ def capture_loop():
                     continue
 
                 # 3. CAPTURE LOOP
-                has_new_updates = False
                 log_status(f"🟢 Capturing...")
                 line_item = start_node
 
@@ -243,24 +273,27 @@ def capture_loop():
                         else: content = line_item.Name
 
                         if content and content.strip():
-                            # EMIT TO WEB
-                            socketio.emit('caption_update', {'id': runtime_id, 'text': content, 'speaker': speaker})
-                            
-                            # UPDATE MEMORY
-                            if runtime_id not in transcript_memory or transcript_memory[runtime_id]['text'] != content:
+                            existing = transcript_memory.get(runtime_id)
+                            if existing is None or existing['text'] != content or existing['speaker'] != speaker:
+                                # UPDATE MEMORY (keep the time the line first appeared)
                                 transcript_memory[runtime_id] = {
-                                    'time': datetime.datetime.now().strftime("%H:%M:%S"),
+                                    'time': existing['time'] if existing else datetime.datetime.now().strftime("%H:%M:%S"),
                                     'speaker': speaker, 'text': content
                                 }
-                                has_new_updates = True
+                                has_unsaved_updates = True
+
+                                # EMIT TO WEB (only new or changed lines)
+                                socketio.emit('caption_update', {'id': runtime_id, 'text': content, 'speaker': speaker})
                     except: pass
                     line_item = line_item.GetNextSiblingControl()
                 
                 # 4. THROTTLED LOGGING
-                # Only write to file if there were updates AND enough time has passed
-                if has_new_updates and (time.time() - last_save_time > LOG_INTERVAL_SECONDS):
+                # Write to file once enough time has passed if anything is still unsaved,
+                # so the last lines of a meeting are saved even if no new captions arrive
+                if has_unsaved_updates and (time.time() - last_save_time > LOG_INTERVAL_SECONDS):
                     update_log_file()
                     last_save_time = time.time()
+                    has_unsaved_updates = False
                 
                 time.sleep(0.1)
 
@@ -273,4 +306,5 @@ def capture_loop():
 if __name__ == '__main__':
     t = threading.Thread(target=capture_loop); t.daemon = True; t.start()
     print(f"Server starting at http://localhost:{PORT}")
-    socketio.run(app, debug=False, host='0.0.0.0', port=PORT)
+    # 127.0.0.1 = only reachable from this computer, not from others on the network
+    socketio.run(app, debug=False, host='127.0.0.1', port=PORT)

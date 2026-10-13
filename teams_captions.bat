@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 
 echo Starting the Python web server in a separate visible window...
 start "Teams Captions Server" python .\teams_captions.py

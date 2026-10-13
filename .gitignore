@@ -1,0 +1,5 @@
+# Personal settings (keywords) - copy from config.example.py
+config.py
+# Meeting transcripts
+logs/
+__pycache__/
